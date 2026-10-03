@@ -1,0 +1,172 @@
+---
+title: "Handling JWT refresh tokens safely: bcrypt's 72-byte limit and timing attacks"
+description: "A practical guide to securing refresh token storage, avoiding silent truncation vulnerabilities in bcrypt, and mitigating timing-based user enumeration."
+date: "2026-10-01"
+category: "Cybersecurity"
+tags: ["jwt", "security", "authentication", "nestjs", "bcrypt"]
+cover: "/images/posts/jwt-security.jpg"
+published: true
+---
+
+> *Note: This is starter technical documentation authored by Dnyaneshwar Panchal and can be customized.*
+
+Token-based authentication using JSON Web Tokens (JWT) is ubiquitous across modern full-stack web applications. While short-lived access tokens limit the exposure window if intercepted, long-lived refresh tokens introduce non-trivial storage and operational challenges. If an attacker gains read access to your session database or can infer account validity through timing anomalies, security breaks down.
+
+In this deep dive, we examine two critical yet frequently overlooked authentication pitfalls: the 72-byte truncation boundary in bcrypt, and user enumeration vulnerabilities caused by asymmetric execution timing.
+
+---
+
+## 1. The Hidden Trap of Bcrypt's 72-Byte Truncation
+
+Bcrypt is widely recognized as an excellent hashing algorithm for user passwords due to its adaptive work factor. However, bcrypt’s internal key schedule operates strictly on the first 72 bytes of input.
+
+If you generate a high-entropy cryptographically secure refresh token—such as a 64-character hexadecimal or base64url string with metadata prefixes—the token's length can easily exceed 72 bytes.
+
+```ts
+// Problematic naive implementation
+const rawRefreshToken = generateRandomToken(); // e.g. 96 bytes long
+const hashedToken = await bcrypt.hash(rawRefreshToken, 10);
+```
+
+When bcrypt receives an input exceeding 72 bytes, **everything past the 72nd byte is silently discarded**. Any token matching the initial 72 bytes will successfully validate, severely degrading entropy and opening the door to collisions.
+
+### The Solution: Pre-Hashing with SHA-256
+
+To preserve complete token entropy while benefiting from bcrypt's tunable work factor, always hash the raw token with SHA-256 before passing it to bcrypt:
+
+```ts
+import crypto from "crypto";
+import bcrypt from "bcrypt";
+
+export function hashRefreshToken(rawToken: string): Promise<string> {
+  // SHA-256 output is fixed at 32 bytes (64 hex characters), well below 72 bytes
+  const preHashed = crypto
+    .createHash("sha256")
+    .update(rawToken)
+    .digest("hex");
+
+  return bcrypt.hash(preHashed, 10);
+}
+
+export async function verifyRefreshToken(rawToken: string, storedHash: string): Promise<boolean> {
+  const preHashed = crypto
+    .createHash("sha256")
+    .update(rawToken)
+    .digest("hex");
+
+  return bcrypt.compare(preHashed, storedHash);
+}
+```
+
+By preprocessing through SHA-256, every single bit of the original arbitrary-length token contributes to the digest, while staying safely beneath the 72-byte ceiling.
+
+---
+
+## 2. Preventing Timing Attacks and User Enumeration
+
+A classic vulnerability in authentication endpoints is the discrepancy in response times between existent and non-existent accounts.
+
+Consider what occurs during standard login or refresh endpoints:
+1. Lookup user in the database by email or ID.
+2. If user does not exist, immediately return `401 Unauthorized` or `404 Not Found`.
+3. If user exists, execute `bcrypt.compare(...)`.
+
+Because `bcrypt.compare` with cost factor 10 takes approximately 80–120ms to evaluate on modern server CPUs, while an immediate rejection takes under 5ms, an attacker can reliably map registered users by measuring response latency.
+
+### The Fix: Constant-Time Dummy Execution
+
+When a user record is not found or is flagged inactive, execute a comparison against a dummy bcrypt hash instead of returning immediately:
+
+```ts
+// Pre-computed constant cost dummy hash
+const DUMMY_HASH = "$2b$10$abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLM";
+
+export async function validateUserCredentials(email: string, passwordAttempt: string) {
+  const user = await userRepository.findByEmail(email);
+
+  if (!user || !user.isActive) {
+    // Run dummy comparison to preserve uniform response timing
+    await bcrypt.compare(passwordAttempt, DUMMY_HASH);
+    throw new UnauthorizedException("Invalid credentials");
+  }
+
+  const isValid = await bcrypt.compare(passwordAttempt, user.passwordHash);
+  if (!isValid) {
+    throw new UnauthorizedException("Invalid credentials");
+  }
+
+  return user;
+}
+```
+
+This ensures both paths consume equivalent computation time, preventing timing-based user enumeration.
+
+---
+
+## 3. Frontend Token Rotation & Request Queuing
+
+In single-page applications (React, Next.js), rotating refresh tokens on expiry introduces another common headache: race conditions. When five concurrent API requests fail with `401 Unauthorized` simultaneously, firing five parallel refresh requests will invalidate the token family if single-use rotation is enforced.
+
+To resolve this on the client side, use an Axios response interceptor that queues incoming requests while a single refresh cycle is executing:
+
+```ts
+let isRefreshing = false;
+let failedQueue: Array<{ resolve: (token: string) => void; reject: (err: any) => void }> = [];
+
+function processQueue(error: any, token: string | null = null) {
+  failedQueue.forEach((prom) => {
+    if (error) {
+      prom.reject(error);
+    } else if (token) {
+      prom.resolve(token);
+    }
+  });
+  failedQueue = [];
+}
+
+apiClient.interceptors.response.use(
+  (response) => response,
+  async (error) => {
+    const originalRequest = error.config;
+
+    if (error.response?.status === 401 && !originalRequest._retry) {
+      if (isRefreshing) {
+        return new Promise((resolve, reject) => {
+          failedQueue.push({ resolve, reject });
+        })
+          .then((newToken) => {
+            originalRequest.headers.Authorization = `Bearer ${newToken}`;
+            return apiClient(originalRequest);
+          })
+          .catch((err) => Promise.reject(err));
+      }
+
+      originalRequest._retry = true;
+      isRefreshing = true;
+
+      try {
+        const { data } = await apiClient.post("/auth/refresh");
+        const newAccessToken = data.accessToken;
+        processQueue(null, newAccessToken);
+        originalRequest.headers.Authorization = `Bearer ${newAccessToken}`;
+        return apiClient(originalRequest);
+      } catch (refreshError) {
+        processQueue(refreshError, null);
+        return Promise.reject(refreshError);
+      } finally {
+        isRefreshing = false;
+      }
+    }
+
+    return Promise.reject(error);
+  }
+);
+```
+
+---
+
+## Summary Checklist
+
+1. **Pre-hash arbitrary-length tokens** using SHA-256 before hashing with bcrypt.
+2. **Execute dummy comparisons** when users are missing or disabled to defend against timing leakage.
+3. **Queue concurrent client requests** during token renewal to preserve smooth user experiences and avoid rotation desyncs.

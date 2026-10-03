@@ -1,0 +1,150 @@
+---
+title: "Payment gateway fees: grossing up an amount so margins survive MDR charges"
+description: "How to calculate pass-through payment processing fees accurately so payment gateway deductions and GST do not erode merchant margins."
+date: "2026-09-25"
+category: "APIs"
+tags: ["payments", "architecture", "fintech", "math", "ecommerce"]
+cover: "/images/posts/payment-fees.jpg"
+published: true
+---
+
+> *Note: This is starter technical documentation authored by Dnyaneshwar Panchal and can be customized.*
+
+In e-commerce platforms and B2B procurement portals, payment gateways deduct a processing fee—known as the Merchant Discount Rate (MDR)—along with statutory taxes on that fee (such as 18% GST in India).
+
+While consumer-facing businesses often absorb MDR as an operational overhead, high-volume B2B systems and marketplaces operating on thin 2% to 5% margins cannot afford to absorb gateway costs. Inadvertently miscalculating how gateways deduct these fees can quickly wipe out profitability.
+
+In this article, we break down the mathematics of payment gateway gross-ups and explain how to engineer resilient reconciliation pipelines.
+
+---
+
+## 1. The Naive Percentage Trap
+
+Suppose an enterprise order has a net payable invoice of ₹10,000. The payment gateway charges a 2.0% MDR on credit card transactions, plus 18% GST on the MDR.
+
+A developer naively calculates the surcharge as:
+
+$$\text{Fee} = 10,000 \times 0.02 = 200$$
+$$\text{GST on Fee} = 200 \times 0.18 = 36$$
+$$\text{Total Surcharge} = 236$$
+
+The checkout system charges the buyer ₹10,236, expecting the gateway to take ₹236 and deposit ₹10,000 into the merchant bank account.
+
+### Why this fails
+
+Payment gateways calculate MDR on the **gross captured amount**, not the merchant's base invoice:
+
+$$\text{Gateway Fee} = 10,236 \times 0.02 = 204.72$$
+$$\text{Gateway GST} = 204.72 \times 0.18 = 36.85$$
+$$\text{Total Gateway Deduction} = 241.57$$
+
+The merchant receives:
+
+$$10,236 - 241.57 = 9,994.43$$
+
+The merchant is short ₹5.57 on a single order. Across thousands of B2B transactions, this discrepancy accumulates into substantial financial losses.
+
+---
+
+## 2. Deriving the Exact Gross-Up Formula
+
+To guarantee that the merchant receives the exact target amount $A_{\text{base}}$ after the gateway deduction, we must solve for the gross captured amount $A_{\text{gross}}$.
+
+Let:
+* $R_{\text{mdr}}$ be the MDR percentage (e.g. 2.0% = 0.02).
+* $R_{\text{gst}}$ be the statutory GST rate on the fee (e.g. 18% = 0.18).
+
+The total deduction fraction $R_{\text{eff}}$ applied to $A_{\text{gross}}$ is:
+
+$$R_{\text{eff}} = R_{\text{mdr}} \times (1 + R_{\text{gst}})$$
+
+Because the net payout equals the gross captured amount minus total deductions:
+
+$$A_{\text{base}} = A_{\text{gross}} - (A_{\text{gross}} \times R_{\text{eff}})$$
+$$A_{\text{base}} = A_{\text{gross}} \times (1 - R_{\text{eff}})$$
+
+Solving for $A_{\text{gross}}$:
+
+$$A_{\text{gross}} = \frac{A_{\text{base}}}{1 - R_{\text{eff}}}$$
+
+### Verifying with our example:
+
+$$R_{\text{eff}} = 0.02 \times (1 + 0.18) = 0.0236$$
+$$A_{\text{gross}} = \frac{10,000}{1 - 0.0236} = \frac{10,000}{0.9764} \approx 10,241.71$$
+
+When the gateway processes ₹10,241.71:
+* $\text{MDR} = 10,241.71 \times 0.02 = 204.834$
+* $\text{GST} = 204.834 \times 0.18 = 36.870$
+* $\text{Total Deduction} = 241.704 \approx 241.71$
+* $\text{Net Payout} = 10,241.71 - 241.71 = 10,000.00$
+
+The merchant receives exactly ₹10,000.
+
+---
+
+## 3. Engineering Implementation in TypeScript
+
+Here is a production-grade helper implementation handling rounding, fee caps, and variable payment instruments:
+
+```ts
+export interface FeeSchedule {
+  mdrPercent: number;
+  gstPercent: number;
+  flatFee?: number;
+  maxFeeCap?: number;
+}
+
+export const INSTRUMENT_FEES: Record<string, FeeSchedule> = {
+  UPI: { mdrPercent: 0.0, gstPercent: 18.0 },
+  DEBIT_CARD: { mdrPercent: 0.85, gstPercent: 18.0 },
+  CREDIT_CARD: { mdrPercent: 2.0, gstPercent: 18.0 },
+  NET_BANKING: { mdrPercent: 1.8, gstPercent: 18.0 },
+};
+
+export function calculateGrossAmount(
+  baseAmountPaise: number,
+  schedule: FeeSchedule
+): { grossAmountPaise: number; feePaise: number; gstPaise: number } {
+  const mdrRate = schedule.mdrPercent / 100;
+  const gstRate = schedule.gstPercent / 100;
+  const effectiveRate = mdrRate * (1 + gstRate);
+
+  if (effectiveRate >= 1) {
+    throw new Error("Invalid fee configuration: Effective rate exceeds 100%");
+  }
+
+  // Calculate gross amount in integer paise to eliminate floating point issues
+  const grossAmountPaise = Math.round(baseAmountPaise / (1 - effectiveRate));
+  const rawFee = Math.round(grossAmountPaise * mdrRate);
+  const gstPaise = Math.round(rawFee * gstRate);
+  const totalDeduction = rawFee + gstPaise;
+
+  return {
+    grossAmountPaise,
+    feePaise: rawFee,
+    gstPaise,
+  };
+}
+```
+
+---
+
+## 4. Architectural Handling of Hosted Checkout Redirects
+
+Most modern payment gateways (such as PhonePe or Razorpay Standard Checkout) use hosted payment pages. The user is redirected to the gateway URL before selecting their payment instrument (UPI, Credit Card, etc.).
+
+This presents an architectural challenge: **How can you compute the gross-up when the customer hasn't selected their instrument yet?**
+
+### The Recommended Solution:
+1. **Pre-order simulation endpoint**: The checkout page calls an API endpoint providing estimated fees across available instruments so the buyer sees transparent breakdowns.
+2. **Order Intent with dynamic capture**: When the gateway supports instrument-specific rules, the gross-up is passed via checkout payloads.
+3. **Webhook Reconciliation against Double-Entry Ledgers**:
+   * Upon receiving the post-payment webhook, extract the exact payment instrument reported by the gateway.
+   * Compare the actual bank settlement deduction against the recorded order ledger.
+   * If any variance exists (for example, if the buyer used a premium international card with an unexpected tier), record an automated ledger discrepancy line for accountant review.
+
+---
+
+## Conclusion
+
+Handling payment gateway fees is fundamentally an applied mathematics and reconciliation problem. By utilizing true gross-up formulas and integer paise calculations, engineering teams ensure their platform's unit economics remain rock-solid regardless of scale.

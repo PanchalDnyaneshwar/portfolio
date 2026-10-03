@@ -1,0 +1,105 @@
+@import "tailwindcss";
+
+@theme {
+  /* Core Surface Palette (Soft Cool Grey Canvas - Single Source of Truth) */
+  --color-bg: #ECEEF3;
+  --color-bg-elevated: #FFFFFF;
+  --color-surface: rgba(255, 255, 255, 0.88);
+  --color-surface-solid: #FFFFFF;
+  --color-surface-hover: #E3E6ED;
+
+  /* Line & Border Tokens */
+  --color-border: rgba(15, 23, 42, 0.09);
+  --color-border-strong: rgba(15, 23, 42, 0.16);
+
+  /* Typography Colors */
+  --color-text: #0F172A;
+  --color-text-muted: #475569;
+  --color-text-subtle: #64748B;
+
+  /* Brand Accents */
+  --color-accent: #4F46E5;
+  --color-accent-soft: #6366F1;
+  --color-accent-2: #0EA5E9;
+
+  /* Status Colors */
+  --color-success: #059669;
+  --color-danger: #DC2626;
+
+  /* Fonts */
+  --font-display: var(--font-space-grotesk), system-ui, sans-serif;
+  --font-sans: var(--font-inter), system-ui, sans-serif;
+  --font-mono: var(--font-jetbrains-mono), ui-monospace, monospace;
+
+  /* Radius Tokens */
+  --radius-sm: 8px;
+  --radius-md: 14px;
+  --radius-lg: 24px;
+  --radius-full: 9999px;
+
+  /* Elevation & Glow */
+  --shadow-glow: 0 0 40px rgba(79, 70, 229, 0.12);
+  --shadow-card: 0 4px 20px rgba(15, 23, 42, 0.07);
+
+  /* Spacing Scale (4px Base Unit: 4, 8, 12, 16, 24, 32, 48, 64, 96, 128) */
+  --spacing-space-1: 4px;
+  --spacing-space-2: 8px;
+  --spacing-space-3: 12px;
+  --spacing-space-4: 16px;
+  --spacing-space-5: 24px;
+  --spacing-space-6: 32px;
+  --spacing-space-7: 48px;
+  --spacing-space-8: 64px;
+  --spacing-space-9: 96px;
+  --spacing-space-10: 128px;
+}
+
+:root {
+  /* Surface Tokens */
+  --bg: #ECEEF3;
+  --bg-elevated: #FFFFFF;
+  --surface: rgba(255, 255, 255, 0.88);
+  --surface-solid: #FFFFFF;
+  --surface-hover: #E3E6ED;
+  --border: rgba(15, 23, 42, 0.09);
+  --border-strong: rgba(15, 23, 42, 0.16);
+  --text: #0F172A;
+  --text-muted: #475569;
+  --text-subtle: #64748B;
+  --accent: #4F46E5;
+  --accent-soft: #6366F1;
+  --accent-2: #0EA5E9;
+  --success: #059669;
+  --danger: #DC2626;
+
+  /* Spacing Variables for Pure CSS & Fluid Layouts */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+  --space-7: 48px;
+  --space-8: 64px;
+  --space-9: 96px;
+  --space-10: 128px;
+
+  /* Layout & Container Constraints */
+  --container-max: 1200px;
+  --gutter: clamp(16px, 4vw, 32px);
+  --section-y: clamp(80px, 10vw, 140px);
+
+  /* Component Heights & Paddings */
+  --nav-height: 72px;
+  --nav-height-mobile: 64px;
+  --card-padding: 32px;
+  --card-padding-mobile: 24px;
+  --button-min-height: 48px;
+
+  /* Focus Ring */
+  --focus-ring: rgba(79, 70, 229, 0.5);
+
+  /* Gradients */
+  --gradient-brand: linear-gradient(135deg, var(--color-accent), var(--color-accent-2));
+  --gradient-hero-name: linear-gradient(135deg, var(--color-text) 30%, var(--color-accent) 100%);
+}

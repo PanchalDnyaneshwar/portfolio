@@ -1,0 +1,182 @@
+---
+title: "Fire-and-forget analytics: keeping dashboards fast with pre-aggregated tables"
+description: "Architecting non-blocking event collection and background rollup pipelines so administrative reporting never competes with live transactional databases."
+date: "2026-09-12"
+category: "Backend"
+tags: ["database", "mysql", "architecture", "analytics", "performance"]
+cover: "/images/posts/analytics-rollup.jpg"
+published: true
+---
+
+> *Note: This is starter technical documentation authored by Dnyaneshwar Panchal and can be customized.*
+
+In the early stages of a web application, computing analytics is deceptively simple. You run `COUNT(*)`, `SUM(total_amount)`, and `GROUP BY` queries directly on your primary transactional tables (`orders`, `order_items`, `users`).
+
+As transaction throughput grows, this approach degrades catastrophically:
+1. Long-running analytical queries lock rows and table indexes.
+2. Checkout queries and inventory mutations stall while waiting for analytics locks to clear.
+3. Dashboard response times balloon from hundreds of milliseconds to several seconds.
+
+In this article, we walk through an enterprise pattern: decoupling live traffic with **fire-and-forget event logging** paired with **scheduled background rollups**.
+
+---
+
+## 1. The Bottleneck: Live Transactional Scans
+
+Consider a marketplace with 200,000 orders and 1,000,000 line items. An administrator opens the vendor dashboard to inspect weekly revenue, top-selling products, and order status distributions.
+
+```sql
+-- Dangerous: Competes directly with live customer checkouts
+SELECT 
+  product_id, 
+  SUM(quantity) AS total_sold, 
+  SUM(price * quantity) AS total_revenue
+FROM order_items
+WHERE created_at >= NOW() - INTERVAL 30 DAY
+GROUP BY product_id
+ORDER BY total_sold DESC
+LIMIT 10;
+```
+
+Even with an index on `(created_at, product_id)`, MySQL must scan hundreds of thousands of leaf nodes, consuming buffer pool memory and locking query threads.
+
+---
+
+## 2. Step 1: The Non-Blocking Event Layer
+
+Rather than inspecting transactional tables after the fact, emit light, decoupled telemetry events whenever significant domain actions occur:
+* `PRODUCT_VIEWED`
+* `ITEM_ADDED_TO_CART`
+* `ORDER_PLACED`
+
+These events are written to an append-only log table:
+
+```sql
+CREATE TABLE analytics_event_log (
+  id BIGINT AUTO_INCREMENT PRIMARY KEY,
+  event_type VARCHAR(64) NOT NULL,
+  entity_id VARCHAR(64) NOT NULL, -- e.g. product_id or vendor_id
+  actor_id VARCHAR(64) NULL,
+  ip_address VARCHAR(45) NULL,
+  payload JSON NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  INDEX idx_event_created (created_at, event_type)
+) ENGINE=InnoDB;
+```
+
+Because inserts to an append-only table occur at the end of the clustered index without updates or row locks, write throughput remains exceptionally fast.
+
+In NestJS or Spring Boot, make this non-blocking via asynchronous execution:
+
+```ts
+import { Injectable, Logger } from "@nestjs/common";
+import { InjectRepository } from "@nestjs/typeorm";
+import { Repository } from "typeorm";
+import { AnalyticsEvent } from "./analytics-event.entity";
+
+@Injectable()
+export class AnalyticsTelemetryService {
+  private readonly logger = new Logger(AnalyticsTelemetryService.name);
+
+  constructor(
+    @InjectRepository(AnalyticsEvent)
+    private readonly eventRepo: Repository<AnalyticsEvent>,
+  ) {}
+
+  // Fire-and-forget execution: never blocks the HTTP response cycle
+  logEvent(eventType: string, entityId: string, metadata: Record<string, any> = {}): void {
+    setImmediate(async () => {
+      try {
+        await this.eventRepo.insert({
+          eventType,
+          entityId,
+          payload: metadata,
+        });
+      } catch (err) {
+        this.logger.error(`Failed to record analytics event: ${eventType}`, err);
+      }
+    });
+  }
+}
+```
+
+---
+
+## 3. Step 2: Scheduled Background Rollup Worker
+
+Instead of querying raw events at request time, a scheduled cron worker (running at midnight or hourly intervals) rolls raw data into compact, pre-aggregated summary tables:
+
+```sql
+CREATE TABLE daily_product_metrics (
+  metric_date DATE NOT NULL,
+  product_id VARCHAR(64) NOT NULL,
+  vendor_id VARCHAR(64) NOT NULL,
+  view_count INT UNSIGNED DEFAULT 0,
+  cart_add_count INT UNSIGNED DEFAULT 0,
+  order_count INT UNSIGNED DEFAULT 0,
+  gross_sales DECIMAL(12, 2) DEFAULT 0.00,
+  PRIMARY KEY (metric_date, product_id),
+  INDEX idx_vendor_date (vendor_id, metric_date)
+) ENGINE=InnoDB;
+```
+
+The rollup script aggregates records for the target window:
+
+```ts
+@Injectable()
+export class DailyRollupCronService {
+  @Cron("0 0 * * *") // Midnight execution
+  async runDailyRollup(): Promise<void> {
+    const yesterday = new Date();
+    yesterday.setDate(yesterday.getDate() - 1);
+    const dateStr = yesterday.toISOString().split("T")[0];
+
+    await this.dataSource.query(`
+      INSERT INTO daily_product_metrics (metric_date, product_id, vendor_id, view_count, order_count, gross_sales)
+      SELECT 
+        DATE(created_at) AS metric_date,
+        entity_id AS product_id,
+        JSON_UNQUOTE(JSON_EXTRACT(payload, '$.vendorId')) AS vendor_id,
+        COUNT(CASE WHEN event_type = 'PRODUCT_VIEW' THEN 1 END) AS view_count,
+        COUNT(CASE WHEN event_type = 'ORDER_PLACED' THEN 1 END) AS order_count,
+        COALESCE(SUM(CAST(JSON_UNQUOTE(JSON_EXTRACT(payload, '$.amount')) AS DECIMAL(12,2))), 0.00) AS gross_sales
+      FROM analytics_event_log
+      WHERE created_at >= '${dateStr} 00:00:00' AND created_at <= '${dateStr} 23:59:59'
+      GROUP BY DATE(created_at), entity_id, vendor_id
+      ON DUPLICATE KEY UPDATE 
+        view_count = VALUES(view_count),
+        order_count = VALUES(order_count),
+        gross_sales = VALUES(gross_sales);
+    `);
+  }
+}
+```
+
+---
+
+## 4. Serving Sub-100ms Dashboard Responses
+
+When administrators or vendors open their telemetry dashboards, the API queries only the pre-aggregated summary table:
+
+```sql
+-- Instant scan of only ~30 rows per vendor
+SELECT 
+  metric_date,
+  order_count,
+  gross_sales
+FROM daily_vendor_metrics
+WHERE vendor_id = 'vnd_123'
+  AND metric_date >= CURRENT_DATE - INTERVAL 30 DAY
+ORDER BY metric_date ASC;
+```
+
+### Measured Impact:
+* **Query Latency**: Decreases from multi-second full table scans to sub-50ms indexed range lookups.
+* **Database Isolation**: Live checkout transactions execute uninterrupted with zero lock contention.
+* **Storage Efficiency**: Raw event logs can be archived to cold storage (e.g., S3 Parquet) after 90 days without affecting dashboard functionality.
+
+---
+
+## Conclusion
+
+Pre-aggregation is one of the most effective strategies for scaling relational databases without immediately taking on the operational overhead of a dedicated data warehouse. By logging events asynchronously and querying materialized daily summaries, your application delivers sub-100ms dashboards while protecting transactional database integrity.
