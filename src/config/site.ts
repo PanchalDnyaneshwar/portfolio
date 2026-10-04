@@ -18,5 +18,5 @@ export const siteConfig = {
     phoneObfuscated: "Nzc0MzkxODMxMg==", // Base64 encoded '7743918312' so it never appears in plain text in HTML source
     showPhone: true,
   },
-  resumeUrl: "/resume/Dnyaneshwar-Panchal-Resume.pdf",
+  resumeUrl: "/resume/Dnyaneshwar-Panchal.pdf",
 } as const;
